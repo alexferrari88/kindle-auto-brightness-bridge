@@ -2,6 +2,8 @@
 
 At the end of substantial work, run the relevant checks, commit the completed changes using Conventional Commits, and then push the commit to the remote. Preserve unrelated work.
 
+Read `worklog.md` before changing the project; update its current status, decisions, blockers, and next action when they materially change.
+
 ## Agent skills
 
 ### Issue tracker

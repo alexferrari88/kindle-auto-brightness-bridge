@@ -8,6 +8,7 @@ local SETTING = "kindleautobrightness_enabled"
 local WARMTH_SETTING = "kindleautobrightness_warmth_enabled"
 local WRAPPER_STATE = "_kindle_auto_brightness_bridge_state"
 local WARMTH_WRAPPER_STATE = "_kindle_auto_warmth_bridge_state"
+local TOGGLE_WRAPPER_STATE = "_kindle_auto_brightness_toggle_state"
 
 local function valid_intensity(powerd, intensity)
     return type(intensity) == "number"
@@ -124,28 +125,62 @@ local function fallback_intensity(powerd, original_ok, original_result)
     return 0
 end
 
+local function observe_intensity(powerd)
+    local intensity, read_error = read_live_intensity(powerd)
+    if intensity == nil then
+        logger.dbg("KindleAutoBrightness: live frontlight read unavailable", read_error)
+        return nil
+    end
+    powerd.is_fl_on = intensity > powerd.fl_min
+    -- Off is an observation, never a new remembered restoration level.
+    if powerd.is_fl_on then
+        powerd.fl_intensity = intensity
+    end
+    return intensity
+end
+
+local function call_original(state, method, this, ...)
+    -- BasePowerD's intensity/off methods call the public on/off methods themselves.
+    -- Suppress nested observations so one public query uses one hardware sample.
+    local was_reading = state.reading
+    state.reading = true
+    local ok, result = pcall(method, this, ...)
+    state.reading = was_reading
+    return ok, result
+end
+
+local function make_state_wrapper(state, method, is_off_query)
+    return function(this, ...)
+        if not state.active then return method(this, ...) end
+        if not state.reading and not state.toggling then
+            local intensity = observe_intensity(this)
+            if intensity ~= nil then
+                if is_off_query then return intensity <= this.fl_min end
+                return intensity > this.fl_min
+            end
+        end
+        local ok, result = call_original(state, method, this, ...)
+        if ok then return result end
+        if is_off_query then return not this.is_fl_on end
+        return this.is_fl_on
+    end
+end
+
 local function make_wrapper(state)
     return function(this, ...)
-        local original_ok, original_result = pcall(state.original_method, this, ...)
+        if not state.active then return state.original_method(this, ...) end
+        local original_ok, original_result = call_original(state, state.original_method, this, ...)
         if not original_ok then
             logger.dbg("KindleAutoBrightness: original frontlightIntensity failed", original_result)
         end
-
-        local live_intensity, read_error = read_live_intensity(this)
-        if live_intensity == nil then
-            logger.dbg("KindleAutoBrightness: live frontlight read unavailable", read_error)
+        if state.toggling then
             return fallback_intensity(this, original_ok, original_result)
         end
-
-        -- A minimum/off read is a state observation, not a new remembered level.
-        if live_intensity <= this.fl_min then
-            this.is_fl_on = false
-            return 0
+        local intensity = observe_intensity(this)
+        if intensity == nil then
+            return fallback_intensity(this, original_ok, original_result)
         end
-
-        this.fl_intensity = live_intensity
-        this.is_fl_on = true
-        return live_intensity
+        return intensity > this.fl_min and intensity or 0
     end
 end
 
@@ -184,18 +219,21 @@ function KindleAutoBrightness:_ensureWrapper()
     end
 
     local existing = current_powerd[WRAPPER_STATE]
-    if existing and existing.wrapper and current_powerd.frontlightIntensity == existing.wrapper then
+    if existing then
+        for name, entry in pairs(existing.methods) do
+            if current_powerd[name] ~= entry.wrapper then
+                logger.dbg("KindleAutoBrightness: refusing to replace another frontlight wrapper")
+                self:_restoreWrapper(current_powerd)
+                return false
+            end
+        end
+        if existing.listener.owner.onToggleFrontlight ~= existing.listener.wrapper then
+            self:_restoreWrapper(current_powerd)
+            return false
+        end
         self.powerd = current_powerd
         self.wrapper_state = existing
         return true
-    end
-    if existing then
-        if current_powerd.frontlightIntensity == existing.original_method then
-            current_powerd[WRAPPER_STATE] = nil
-        else
-            logger.dbg("KindleAutoBrightness: refusing to replace another frontlight wrapper")
-            return false
-        end
     end
 
     local original_method = current_powerd.frontlightIntensity
@@ -204,12 +242,76 @@ function KindleAutoBrightness:_ensureWrapper()
     end
 
     local state = {
+        active = true,
         original_method = original_method,
         original_raw_method = rawget(current_powerd, "frontlightIntensity"),
     }
     state.wrapper = make_wrapper(state)
+    state.methods = {
+        frontlightIntensity = {
+            original = state.original_raw_method,
+            wrapper = state.wrapper,
+        },
+    }
+    for _, name in ipairs({ "isFrontlightOn", "isFrontlightOff" }) do
+        local method = current_powerd[name]
+        if type(method) == "function" then
+            state.methods[name] = {
+                original = rawget(current_powerd, name),
+                wrapper = make_state_wrapper(state, method, name == "isFrontlightOff"),
+            }
+        end
+    end
+    -- Kindle's write coda calls this directly, bypassing the public state queries.
+    -- A broken live reader must not throw after a successful user-requested write.
+    local original_on_hw = current_powerd.isFrontlightOnHW
+    if type(original_on_hw) == "function" then
+        state.methods.isFrontlightOnHW = {
+            original = rawget(current_powerd, "isFrontlightOnHW"),
+            wrapper = function(this, ...)
+                if not state.active then return original_on_hw(this, ...) end
+                local intensity = read_live_intensity(this)
+                if intensity ~= nil then return intensity > this.fl_min end
+                return this.is_fl_on
+            end,
+        }
+    end
+    local listener = require("device/devicelistener")
+    local hook = rawget(listener, TOGGLE_WRAPPER_STATE)
+    if not hook or listener.onToggleFrontlight ~= hook.wrapper then
+        if hook then hook.active = false end
+        local original_toggle = listener.onToggleFrontlight
+        hook = {
+            active = true,
+            owner = listener,
+            original = rawget(listener, "onToggleFrontlight"),
+        }
+        hook.wrapper = function(this, ...)
+            local powerd = get_powerd(Device)
+            local current_state = powerd and powerd[WRAPPER_STATE]
+            if not hook.active or not current_state or not current_state.active then
+                return original_toggle(this, ...)
+            end
+            local was_toggling = current_state.toggling
+            if not was_toggling then observe_intensity(powerd) end
+            -- Notification selection and the toggle guards share the entry state.
+            -- Core writes update the cache before callbacks and resume queries.
+            current_state.toggling = true
+            local function finish(ok, ...)
+                current_state.toggling = was_toggling
+                if not ok then error((...), 0) end
+                return ...
+            end
+            return finish(pcall(original_toggle, this, ...))
+        end
+        listener[TOGGLE_WRAPPER_STATE] = hook
+        listener.onToggleFrontlight = hook.wrapper
+    end
+    state.listener = hook
     current_powerd[WRAPPER_STATE] = state
-    current_powerd.frontlightIntensity = state.wrapper
+    for name, entry in pairs(state.methods) do
+        current_powerd[name] = entry.wrapper
+    end
     self.powerd = current_powerd
     self.wrapper_state = state
     return true
@@ -227,15 +329,23 @@ function KindleAutoBrightness:_restoreWrapper(powerd_to_restore)
         return true
     end
 
-    if current_powerd.frontlightIntensity ~= state.wrapper then
-        logger.dbg("KindleAutoBrightness: leaving a changed frontlight method untouched")
-        return false
+    -- Other owners may retain our functions in their own wrapper chains.
+    -- Deactivate the whole set before restoring the methods we still own.
+    state.active = false
+    for name, entry in pairs(state.methods) do
+        if current_powerd[name] == entry.wrapper then
+            current_powerd[name] = entry.original
+        else
+            logger.dbg("KindleAutoBrightness: leaving a changed frontlight method untouched", name)
+        end
     end
-
-    if state.original_raw_method == nil then
-        current_powerd.frontlightIntensity = nil
-    else
-        current_powerd.frontlightIntensity = state.original_raw_method
+    local hook = state.listener
+    if get_powerd(Device) == current_powerd and rawget(hook.owner, TOGGLE_WRAPPER_STATE) == hook then
+        hook.active = false
+        if hook.owner.onToggleFrontlight == hook.wrapper then
+            hook.owner.onToggleFrontlight = hook.original
+        end
+        hook.owner[TOGGLE_WRAPPER_STATE] = nil
     end
     current_powerd[WRAPPER_STATE] = nil
     self.wrapper_state = nil

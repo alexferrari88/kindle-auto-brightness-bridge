@@ -317,6 +317,43 @@ describe("Kindle Auto Brightness Bridge", function()
         return require("device/devicelistener")
     end
 
+    -- Run the real generic/Kindle controllers; only the platform boundary is simulated.
+    local function new_kindle_plugin()
+        package.preload["optmath"] = function()
+            return { round = function(n) return math.floor(n + 0.5) end }
+        end
+        package.preload["ui/time"] = function() return { s = function(n) return n end } end
+        package.preload["device/wakeupmgr"] = function() return {} end
+        package.preload["device/generic/powerd"] = function()
+            return assert(loadfile(koreader_root .. "/frontend/device/generic/powerd.lua"))()
+        end
+        local device = make_device({ natural_light = false })
+        function device:canTurnFrontlightOff() return true end
+        local hardware = { intensity = 10, writes = 0 }
+        local KindlePowerD = assert(loadfile(koreader_root .. "/frontend/device/kindle/powerd.lua"))()
+        local powerd = KindlePowerD:new{
+            device = device,
+            init = function() end,
+            lipc_handle = {
+                get_int_property = function(_, _, property)
+                    assert.equals("flIntensity", property)
+                    return hardware.intensity
+                end,
+                set_int_property = function(_, _, property, value)
+                    assert.equals("flIntensity", property)
+                    hardware.intensity = value
+                    hardware.writes = hardware.writes + 1
+                end,
+            },
+        }
+        device.powerd = powerd
+        local notifications = {}
+        local listener_class = load_device_listener(device, notifications)
+        local _, plugin = new_plugin({ powerd = powerd, natural_light = false }, true)
+        local listener = listener_class:new{}
+        return plugin, powerd, hardware, listener, notifications, device
+    end
+
     before_each(function()
         original_device = package.loaded.device
         original_notification = package.loaded["ui/widget/notification"]
@@ -330,6 +367,238 @@ describe("Kindle Auto Brightness Bridge", function()
         restore_module("ui/uimanager", original_uimanager)
         restore_module("device/devicelistener", original_devicelistener)
         reset_settings()
+    end)
+
+    it("toggles external re-enabling off immediately through the real Kindle notification path", function()
+        local _, powerd, hardware, listener, notifications = new_kindle_plugin()
+        listener:onToggleFrontlight()
+        assert.equals(0, hardware.intensity)
+        assert.equals("Frontlight disabled.", notifications[#notifications])
+        hardware.intensity = 20
+        listener:onToggleFrontlight()
+        assert.equals(0, hardware.intensity)
+        assert.equals("Frontlight disabled.", notifications[#notifications])
+        assert.equals(20, powerd.fl_intensity)
+    end)
+
+    it("observes external changes without writes and restores the last nonzero Kindle brightness", function()
+        local _, powerd, hardware, listener, notifications = new_kindle_plugin()
+        hardware.intensity = 18
+        assert.is_true(powerd:isFrontlightOn())
+        assert.is_false(powerd:isFrontlightOff())
+        assert.equals(18, powerd:frontlightIntensity())
+        hardware.intensity = 0
+        assert.is_false(powerd:isFrontlightOn())
+        assert.is_true(powerd:isFrontlightOff())
+        assert.equals(0, powerd:frontlightIntensity())
+        assert.equals(18, powerd.fl_intensity)
+        assert.equals(0, hardware.writes)
+        listener:onToggleFrontlight()
+        assert.equals(18, hardware.intensity)
+        assert.equals("Frontlight enabled.", notifications[#notifications])
+        assert.is_true(powerd.fl_was_on)
+    end)
+
+    it("keeps real Kindle observations and toggles usable when live reads fail", function()
+        local readers = {
+            function() return nil end,
+            function() error("temporary read failure") end,
+            function() return "20" end,
+            function() return 0 / 0 end,
+            function() return -1 end,
+            function() return 25 end,
+        }
+        for _, reader in ipairs(readers) do
+            local _, powerd, hardware, listener, notifications = new_kindle_plugin()
+            powerd.frontlightIntensityHW = reader
+            assert.is_true(powerd:isFrontlightOn())
+            assert.is_false(powerd:isFrontlightOff())
+            assert.equals(10, powerd:frontlightIntensity())
+            assert.equals(0, hardware.writes)
+            listener:onToggleFrontlight()
+            assert.equals(0, hardware.intensity)
+            assert.equals("Frontlight disabled.", notifications[#notifications])
+            assert.is_false(powerd:isFrontlightOn())
+            assert.is_true(powerd:isFrontlightOff())
+            listener:onToggleFrontlight()
+            assert.equals(10, hardware.intensity)
+            assert.equals("Frontlight enabled.", notifications[#notifications])
+            assert.is_true(powerd:isFrontlightOn())
+        end
+    end)
+
+    it("uses one live sample per real public query despite nested original state queries", function()
+        local _, powerd, hardware = new_kindle_plugin()
+        local reads = 0
+        powerd.frontlightIntensityHW = function()
+            reads = reads + 1
+            assert.is_true(reads <= 1, "nested observation or recursion")
+            return hardware.intensity
+        end
+        for _, name in ipairs({ "frontlightIntensity", "isFrontlightOn", "isFrontlightOff" }) do
+            reads = 0
+            powerd[name](powerd)
+            assert.equals(1, reads)
+        end
+        assert.equals(0, hardware.writes)
+    end)
+
+    it("restores inherited Kindle methods and preserves another owner's state replacement", function()
+        local plugin, powerd, hardware = new_kindle_plugin()
+        local names = { "frontlightIntensity", "isFrontlightOn", "isFrontlightOff", "isFrontlightOnHW" }
+        local wrappers = {}
+        for _, name in ipairs(names) do wrappers[name] = powerd[name] end
+        plugin:_setEnabled(true)
+        plugin:onResume()
+        plugin:onResume()
+        for _, name in ipairs(names) do assert.equals(wrappers[name], powerd[name]) end
+        local replacement = function() return "other owner" end
+        powerd.isFrontlightOff = replacement
+        plugin:onResume()
+        assert.equals(replacement, powerd.isFrontlightOff)
+        plugin:_setEnabled(false)
+        assert.equals(replacement, powerd.isFrontlightOff)
+        for _, name in ipairs({ "frontlightIntensity", "isFrontlightOn", "isFrontlightOnHW" }) do
+            assert.is_nil(rawget(powerd, name))
+            assert.are_not.equal(wrappers[name], powerd[name])
+        end
+        assert.is_nil(powerd[WRAPPER_STATE])
+        hardware.intensity = 0
+        assert.is_true(powerd:isFrontlightOn()) -- disabled: original cached behavior
+        assert.equals(0, hardware.writes)
+        plugin:_setEnabled(false)
+        assert.equals(replacement, powerd.isFrontlightOff)
+    end)
+
+    it("stops all brightness synchronization when resume encounters another owner's replacement", function()
+        local plugin, powerd, hardware = new_kindle_plugin()
+        powerd.isFrontlightOff = function() return false end
+        plugin:onResume()
+        assert.is_false(plugin.enabled)
+        assert.is_false(G_reader_settings:isTrue(SETTING))
+        hardware.intensity = 0
+        assert.is_true(powerd:isFrontlightOn())
+        assert.equals(10, powerd:frontlightIntensity())
+        assert.equals(10, powerd.fl_intensity)
+        assert.is_nil(powerd[WRAPPER_STATE])
+    end)
+
+    it("deactivates captured bridge wrappers while preserving another owner's wrapper", function()
+        local plugin, powerd, hardware = new_kindle_plugin()
+        local captured = powerd.isFrontlightOn
+        local replacement = function(this) return captured(this) end
+        powerd.isFrontlightOn = replacement
+        plugin:_setEnabled(false)
+        hardware.intensity = 0
+        assert.equals(replacement, powerd.isFrontlightOn)
+        assert.is_true(powerd:isFrontlightOn())
+        assert.equals(10, powerd:frontlightIntensity())
+        assert.equals(10, powerd.fl_intensity)
+        plugin:_setEnabled(true)
+        assert.is_true(plugin.enabled)
+        assert.is_false(powerd:isFrontlightOn())
+        plugin:_setEnabled(false)
+        assert.equals(replacement, powerd.isFrontlightOn)
+        hardware.intensity = 20
+        assert.is_false(powerd:isFrontlightOn())
+    end)
+
+    it("uses the first observation for both the toggle action and its notification", function()
+        local _, powerd, hardware, listener, notifications = new_kindle_plugin()
+        local reads = 0
+        powerd.frontlightIntensityHW = function()
+            reads = reads + 1
+            if reads == 2 then hardware.intensity = 0 end
+            return hardware.intensity
+        end
+        listener:onToggleFrontlight()
+        assert.equals(0, hardware.intensity)
+        assert.equals("Frontlight disabled.", notifications[#notifications])
+        assert.is_false(powerd.fl_was_on)
+    end)
+
+    it("keeps an invalid entry observation coherent and clears the scope after handler errors", function()
+        local _, powerd, hardware, listener, notifications = new_kindle_plugin()
+        local reads = 0
+        powerd.frontlightIntensityHW = function()
+            reads = reads + 1
+            if reads == 1 then return nil end
+            return 0
+        end
+        listener:onToggleFrontlight()
+        assert.equals(0, hardware.intensity)
+        assert.equals("Frontlight disabled.", notifications[#notifications])
+        powerd.frontlightIntensityHW = function() return hardware.intensity end
+        hardware.intensity = 10
+        powerd.lipc_handle.set_int_property = function() error("write failed") end
+        assert.has_error(function() listener:onToggleFrontlight() end, "write failed")
+        hardware.intensity = 0
+        assert.is_false(powerd:isFrontlightOn())
+    end)
+
+    it("restores nested toggle scopes and deactivates another owner's captured handler", function()
+        local plugin, powerd, hardware, listener, notifications = new_kindle_plugin()
+        local notification = require("ui/widget/notification")
+        local notify = notification.notify
+        local nested = false
+        notification.notify = function(this, text)
+            notify(this, text)
+            if not nested then
+                nested = true
+                listener:onToggleFrontlight()
+            end
+        end
+        listener:onToggleFrontlight()
+        assert.equals(10, hardware.intensity)
+        assert.equals("Frontlight enabled.", notifications[#notifications])
+        hardware.intensity = 0
+        assert.is_false(powerd:isFrontlightOn())
+        local listener_class = require("device/devicelistener")
+        local captured = listener_class.onToggleFrontlight
+        local replacement = function(this, ...) return captured(this, ...) end
+        listener_class.onToggleFrontlight = replacement
+        plugin:_setEnabled(false)
+        assert.equals(replacement, listener_class.onToggleFrontlight)
+        hardware.intensity = 20
+        listener:onToggleFrontlight()
+        assert.equals(10, hardware.intensity) -- disabled: original cached-off decision
+        assert.equals("Frontlight enabled.", notifications[#notifications])
+    end)
+
+    it("reuses the handler hook and observes the current power device across plugin instances", function()
+        local _, powerd, hardware, listener, notifications, device = new_kindle_plugin()
+        local listener_class = require("device/devicelistener")
+        local hook = listener_class.onToggleFrontlight
+        local next_powerd = getmetatable(powerd):new{
+            device = device,
+            init = function() end,
+            lipc_handle = powerd.lipc_handle,
+        }
+        device.powerd = next_powerd
+        local next_plugin = load_plugin(device):new{}
+        assert.equals(hook, listener_class.onToggleFrontlight)
+        hardware.intensity = 20
+        listener:onToggleFrontlight()
+        assert.equals(0, hardware.intensity)
+        assert.equals("Frontlight disabled.", notifications[#notifications])
+        assert.equals(20, next_powerd.fl_intensity)
+        next_plugin:_setEnabled(false)
+        assert.are_not.equal(hook, listener_class.onToggleFrontlight)
+    end)
+
+    it("preserves another handler owner's arguments and multiple return values", function()
+        local plugin, _, _, listener = new_kindle_plugin()
+        plugin:_setEnabled(false)
+        local listener_class = require("device/devicelistener")
+        local original = listener_class.onToggleFrontlight
+        listener_class.onToggleFrontlight = function(this, first, second)
+            original(this)
+            return first, nil, second
+        end
+        plugin:_setEnabled(true)
+        local function collect(...) return { n = select("#", ...), ... } end
+        local results = collect(listener:onToggleFrontlight("first", "second"))
+        assert.same({ n = 3, [1] = "first", [3] = "second" }, results)
     end)
 
     it("is disabled on non-Kindle, non-ALS, non-frontlit, and API-unsupported devices", function()

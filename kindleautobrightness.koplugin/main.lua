@@ -509,8 +509,7 @@ function KindleAutoBrightness:addToMainMenu(menu_items)
         sorting_hint = "more_tools",
         help_text = _([[
 This external plugin requires native Kindle Auto Brightness to be enabled first.
-It makes KOReader's brightness controls read Amazon's current hardware brightness; it does not
-implement its own ambient light sensor (ALS) algorithm.]]),
+It makes KOReader's brightness controls read Amazon's current hardware brightness; it does not implement its own ambient light sensor (ALS) algorithm.]]),
         checked_func = function()
             return self.enabled
         end,
@@ -527,10 +526,8 @@ implement its own ambient light sensor (ALS) algorithm.]]),
             text = _("Synchronize with Kindle scheduled warmth"),
             sorting_hint = "more_tools",
             help_text = _([[
-This makes KOReader's warmth controls read the actual current Kindle hardware warmth on demand,
-including changes made by Kindle's schedule. It does not choose or run a schedule.
-If KOReader AutoWarmth is also enabled, the two schedulers remain independent; do not expect them
-to cooperate as one algorithm.]]),
+This makes KOReader's warmth controls read the actual current Kindle hardware warmth on demand, including changes made by Kindle's schedule. It does not choose or run a schedule.
+If KOReader AutoWarmth is also enabled, the two schedulers remain independent; do not expect them to cooperate as one algorithm.]]),
             checked_func = function()
                 return self.warmth_enabled
             end,

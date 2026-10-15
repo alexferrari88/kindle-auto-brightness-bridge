@@ -1,9 +1,10 @@
 # Current work
 
-- Goal: implement issue #6, “On/off status sync,” against its approved GitHub agent brief.
-- Status: implemented, independently reviewed, installed, and verified on the physical Kindle. Starting commit: `789b292`.
-- Scope: synchronize public frontlight state queries and toggles with valid hardware observations, preserve remembered brightness, and restore original behavior on disable. Keep warmth independent and retain on-demand reads without polling.
-- Verification: all 33 tests pass against source revision `459bcc346`, the emulator's v2026.07.1 code, and a source snapshot from the Kindle's v2026.07.2 installation. Lua syntax and whitespace checks pass. The desktop emulator passed an isolated startup smoke.
-- Review: final standards review found no rule violations; final spec review found no remaining correctness or scope defects. Regressions cover all three lifecycle/notification findings from the first review.
-- Device: 18 checks passed inside the running KOReader session using native LIPC hardware and the real toggle/notification path. External re-enable switches off with one toggle; external off restores remembered brightness. Original light level, cache, and warmth setting were restored. Installed source matches the tested local plugin; the old source is backed up. Temporary HTTP inspector was stopped and its autostart cleared.
-- Next: no further implementation or device acceptance work remains.
+- Goal: merge PR #5, publish v0.2.1, install it on the Kindle, and verify local/remote main parity.
+- Status: PR #5 squash-merged as `7975a0d`; v0.2.1 published from that revision with the verified plugin ZIP attached. Plugin files installed on the Kindle running KOReader v2026.07.2. Only this release handoff differs from the tagged source.
+- Release scope: frontlight on/off synchronization from issue #6 and removal of three forced help-text line breaks from PR #5. Existing settings preserved.
+- Verification: all 33 regression tests pass against the local KOReader source snapshot; local Lua syntax and whitespace checks pass. Uploaded ZIP downloaded and verified byte-for-byte against the source archive. Both installed modules match the release SHA-256 hashes and pass native Kindle Lua syntax checks.
+- Previous device acceptance: issue #6 passed 18 checks inside the running KOReader session, including native hardware reads and the real toggle/notification path. The help-text change was not newly rendered during this release.
+- Backup: previous installed modules retained in `/mnt/us/koreader/data/plugin-backups/kindleautobrightness-before-v0.2.1-20261015T080801Z/`. Existing older backup preserved.
+- Activation: KOReader was already running during file replacement; restart KOReader once to load the new help strings. No forced termination, settings edits, or temporary HTTP inspector were used.
+- Next: user restarts KOReader to activate the installed update; no further release or file-transfer work remains.
